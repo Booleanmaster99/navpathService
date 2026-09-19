@@ -52,24 +52,28 @@ impl Snapshot {
         let lm_len = (manifest.counts.nodes as usize)
             .saturating_mul(manifest.counts.landmarks as usize)
             .saturating_mul(4);
-        let _ = mmap.advise(memmap2::Advice::Random);
-        if lm_len > 0 && lm_off.checked_add(lm_len).is_some_and(|end| end <= mmap.len()) {
-            if lm_off > 0 {
-                let _ = mmap.advise_range(memmap2::Advice::WillNeed, 0, lm_off);
+        // madvise is unix-only in memmap2; on Windows the hints are simply skipped.
+        #[cfg(unix)]
+        {
+            let _ = mmap.advise(memmap2::Advice::Random);
+            if lm_len > 0 && lm_off.checked_add(lm_len).is_some_and(|end| end <= mmap.len()) {
+                if lm_off > 0 {
+                    let _ = mmap.advise_range(memmap2::Advice::WillNeed, 0, lm_off);
+                }
+                let tail = lm_off + lm_len;
+                if tail < mmap.len() {
+                    let _ = mmap.advise_range(memmap2::Advice::WillNeed, tail, mmap.len() - tail);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = mmap.advise_range(memmap2::Advice::HugePage, lm_off, lm_len);
+                }
+            } else {
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
             }
-            let tail = lm_off + lm_len;
-            if tail < mmap.len() {
-                let _ = mmap.advise_range(memmap2::Advice::WillNeed, tail, mmap.len() - tail);
+            if std::env::var("NAVPATH_MMAP_POPULATE").ok().as_deref() == Some("1") {
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
             }
-            #[cfg(target_os = "linux")]
-            {
-                let _ = mmap.advise_range(memmap2::Advice::HugePage, lm_off, lm_len);
-            }
-        } else {
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
-        }
-        if std::env::var("NAVPATH_MMAP_POPULATE").ok().as_deref() == Some("1") {
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
         }
 
         let alt_heap = if std::env::var("NAVPATH_ALT_HEAP").ok().as_deref() == Some("1")
@@ -120,9 +124,12 @@ impl Snapshot {
     /// `mlock` the mapping so the page cache cannot evict it under memory pressure.
     /// Fails (harmlessly) when `RLIMIT_MEMLOCK` is below the snapshot size.
     pub fn lock_memory(&self) -> std::io::Result<()> {
-        self.mmap.lock()?;
-        if let Some(h) = &self.alt_heap {
-            h.lock()?;
+        #[cfg(unix)]
+        {
+            self.mmap.lock()?;
+            if let Some(h) = &self.alt_heap {
+                h.lock()?;
+            }
         }
         Ok(())
     }
